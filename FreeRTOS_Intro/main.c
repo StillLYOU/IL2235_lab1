@@ -20,6 +20,9 @@ typedef struct {
     uint64_t start_time;     /* When job started executing */
     uint64_t finish_time;    /* When job completed */
     uint64_t exec_time;      /* Execution duration */
+    uint64_t deadline;       /* Absolute deadline */
+    bool deadline_missed;    /* Whether deadline was missed */
+    bool skipped;            /* Whether task was skipped */
 } log_entry_t;
 
 /* Task parameters structure */
@@ -44,6 +47,9 @@ TaskHandle_t task_F_handle;
 log_entry_t log_buffer[MAX_LOGS_PER_HYPERPERIOD];
 volatile uint32_t log_count = 0;
 SemaphoreHandle_t log_mutex;
+
+/* Global scheduler start time (shared by all tasks) */
+static uint64_t scheduler_start_time_us = 0;
 
 /**
  * @brief Periodic task template
@@ -114,7 +120,7 @@ int main()
         .job_func = job_C,
         .period_ms = 25,
         .deadline_ms = 25,
-        .priority = 3,
+        .priority = 1,
         .job_count = 0
     };
 
@@ -123,7 +129,7 @@ int main()
         .job_func = job_D,
         .period_ms = 50,
         .deadline_ms = 50,
-        .priority = 2,
+        .priority = 3,
         .job_count = 0
     };
 
@@ -132,7 +138,7 @@ int main()
         .job_func = job_E,
         .period_ms = 50,
         .deadline_ms = 50,
-        .priority = 1,  /* Lowest priority */
+        .priority = 2,  /* Lowest priority */
         .job_count = 0
     };
 
@@ -191,25 +197,92 @@ void periodic_task(void *args)
     /* Initialize the xLastWakeTime variable with the current time */
     xLastWakeTime = xTaskGetTickCount();
 
+    /* Initialize global scheduler start time on first task activation (using atomic operation) */
+    static bool scheduler_initialized = false;
+    if (!scheduler_initialized) {
+        scheduler_start_time_us = time_us_64();
+        scheduler_initialized = true;
+    }
+
     /* Periodic task loop */
     for (;;) {
-        /* Calculate theoretical release time for this job */
-        uint64_t release_time_us = (uint64_t)params->job_count * params->period_ms * 1000;
+        /* Calculate theoretical release time and deadline for this job (absolute time) */
+        uint64_t release_time_us = scheduler_start_time_us + ((uint64_t)params->job_count * params->period_ms * 1000);
+        uint64_t deadline_us = release_time_us + (params->deadline_ms * 1000);
+        bool skip_execution = false;
 
-        /* Execute the job */
-        params->job_func(&result);
+        /* Special handling for Task_C: check if there's enough time before executing */
+        if (params->job_func == job_C) {
+            /* Read GPIO switches to get actual execution time for Task_C */
+            bool bit7 = BSP_GetInput(SW_10);
+            bool bit6 = BSP_GetInput(SW_11);
+            bool bit5 = BSP_GetInput(SW_12);
+            bool bit4 = BSP_GetInput(SW_13);
+            bool bit3 = BSP_GetInput(SW_14);
+            bool bit2 = BSP_GetInput(SW_15);
+            bool bit1 = BSP_GetInput(SW_16);
+            bool bit0 = BSP_GetInput(SW_17);
 
-        /* Log execution information */
-        if (xSemaphoreTake(log_mutex, portMAX_DELAY) == pdTRUE) {
-            if (log_count < MAX_LOGS_PER_HYPERPERIOD) {
-                log_buffer[log_count].task_name = params->name;
-                log_buffer[log_count].release_time = release_time_us;
-                log_buffer[log_count].start_time = result.start;
-                log_buffer[log_count].finish_time = result.stop;
-                log_buffer[log_count].exec_time = result.stop - result.start;
-                log_count++;
+            uint8_t switch_value = (bit7 << 7) | (bit6 << 6) | (bit5 << 5) | (bit4 << 4) |
+                                   (bit3 << 3) | (bit2 << 2) | (bit1 << 1) | bit0;
+
+            /* Calculate Task_C's actual execution time from GPIO */
+            uint32_t task_c_wcet_us = ((switch_value * 8000) / 256);
+
+            /* Check if there's enough time to complete Task_C before deadline */
+            uint64_t current_time = time_us_64();
+            int64_t time_remaining = (int64_t)deadline_us - (int64_t)current_time;
+
+            if (time_remaining < (int64_t)task_c_wcet_us) {
+                /* Not enough time - skip Task_C */
+                skip_execution = true;
+
+                /* LED indication */
+                BSP_ToggleLED(LED_RED);
+
+                /* Log skipped task */
+                if (xSemaphoreTake(log_mutex, portMAX_DELAY) == pdTRUE) {
+                    if (log_count < MAX_LOGS_PER_HYPERPERIOD) {
+                        log_buffer[log_count].task_name = params->name;
+                        log_buffer[log_count].release_time = release_time_us;
+                        log_buffer[log_count].start_time = 0;
+                        log_buffer[log_count].finish_time = 0;
+                        log_buffer[log_count].exec_time = 0;
+                        log_buffer[log_count].deadline = deadline_us;
+                        log_buffer[log_count].deadline_missed = true;
+                        log_buffer[log_count].skipped = true;
+                        log_count++;
+                    }
+                    xSemaphoreGive(log_mutex);
+                }
             }
-            xSemaphoreGive(log_mutex);
+        }
+
+        /* Execute the job if not skipped */
+        if (!skip_execution) {
+            params->job_func(&result);
+
+            /* Check for deadline miss */
+            bool missed = (result.stop > deadline_us);
+            if (missed) {
+                BSP_ToggleLED(LED_RED);
+            }
+
+            /* Log execution information */
+            if (xSemaphoreTake(log_mutex, portMAX_DELAY) == pdTRUE) {
+                if (log_count < MAX_LOGS_PER_HYPERPERIOD) {
+                    log_buffer[log_count].task_name = params->name;
+                    log_buffer[log_count].release_time = release_time_us;
+                    log_buffer[log_count].start_time = result.start;
+                    log_buffer[log_count].finish_time = result.stop;
+                    log_buffer[log_count].exec_time = result.stop - result.start;
+                    log_buffer[log_count].deadline = deadline_us;
+                    log_buffer[log_count].deadline_missed = missed;
+                    log_buffer[log_count].skipped = false;
+                    log_count++;
+                }
+                xSemaphoreGive(log_mutex);
+            }
         }
 
         /* Increment job counter */
@@ -247,16 +320,44 @@ void monitor_task(void *args)
 
         /* Get exclusive access to log buffer */
         if (xSemaphoreTake(log_mutex, portMAX_DELAY) == pdTRUE) {
+            uint32_t deadline_misses = 0;
+            uint32_t skipped_count = 0;
+
+            /* Print header */
+            printf("Task   | Release    | Start      | Finish     | Deadline   | Exec Time | Status\n");
+            printf("-------+------------+------------+------------+------------+-----------+---------\n");
+
             /* Print all logged executions */
             for (uint32_t i = 0; i < log_count; i++) {
-                printf("[%s] R:%llu S:%llu C:%llu E:%llu us\n",
+                const char* status;
+                if (log_buffer[i].skipped) {
+                    status = "SKIPPED";
+                    skipped_count++;
+                    deadline_misses++;
+                } else if (log_buffer[i].deadline_missed) {
+                    status = "  MISS ";
+                    deadline_misses++;
+                } else {
+                    status = "   OK  ";
+                }
+
+                printf("%-6s | %10llu | %10llu | %10llu | %10llu | %6llu us | %s\n",
                        log_buffer[i].task_name,
                        log_buffer[i].release_time,
                        log_buffer[i].start_time,
                        log_buffer[i].finish_time,
-                       log_buffer[i].exec_time);
+                       log_buffer[i].deadline,
+                       log_buffer[i].exec_time,
+                       status);
             }
+            printf("========================================================================\n");
             printf("Total logs: %u\n", log_count);
+            printf("Deadline misses: %u\n", deadline_misses);
+            printf("Tasks skipped: %u\n", skipped_count);
+            if (deadline_misses > 0) {
+                printf("\n*** WARNING: Deadline violations detected! ***\n");
+                printf("Response Strategy: SKIP TASK_C IF INSUFFICIENT TIME BEFORE EXECUTION\n");
+            }
             printf("====================================\n\n");
 
             /* Reset log buffer for next hyperperiod */

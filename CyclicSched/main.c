@@ -29,6 +29,8 @@ typedef struct {
     uint64_t start_time;     /* Actual execution start time */
     uint64_t completion_time; /* Completion time */
     uint64_t exec_time;      /* Execution time */
+    uint64_t deadline;       /* Absolute deadline for this job */
+    bool deadline_missed;    /* Flag indicating if deadline was missed */
 } job_record_t;
 
 /* Global variables */
@@ -37,60 +39,65 @@ static repeating_timer_t frame_timer;
 static job_record_t job_log[MAX_JOBS_PER_HYPERPERIOD];
 static uint32_t job_count = 0;
 static uint32_t hyperperiod_count = 0;
+static uint64_t scheduler_start_time = 0;  /* Absolute start time of scheduler */
+
+/* Deadline miss tracking */
+static uint32_t deadline_misses_current = 0;  /* Misses in current hyperperiod */
+static uint32_t deadline_misses_total = 0;    /* Total misses since start */
 
 /* Static schedule table for the hyperperiod (20 frames)
- * Optimized cyclic schedule meeting all deadlines within 5ms frames
- * Execution pattern per hyperperiod:
- *   A: frames 1,3,5,7,9,11,13,15,17,19 (10 times, period=2 frames)
- *   B: frames 0-19 (20 times, period=1 frame) - ALWAYS FIRST
- *   C: frames 2,7,12,17 (4 times, period=5 frames)
- *   D: frames 2,12 (2 times, period=10 frames)
- *   E: frames 0,10 (2 times, period=10 frames)
- *   F: frames 4,8,12,16 (4 times, period=4 frames) + frame 0 of next hyperperiod
+ * Custom cyclic schedule pattern:
+ * BAD, BF, BA, BC, BAF, BC, BA, BE, BAF, B, BAD, BC, BAF, BD, BA, BC, BAF, BE, BA, B
  *
- * Note: Task_F executes 4 times in frames 4,8,12,16, with 5th instance at start of next hyperperiod
+ * Execution pattern per hyperperiod:
+ *   A: frames 0,2,4,6,8,10,12,14,16,18 (10 times)
+ *   B: frames 0-19 (20 times, every frame) - ALWAYS FIRST
+ *   C: frames 3,5,11,15 (4 times)
+ *   D: frames 0,10,13 (3 times)
+ *   E: frames 7,17 (2 times)
+ *   F: frames 1,4,8,12,16 (5 times)
  */
 static frame_schedule_t schedule[NUM_FRAMES] = {
-    /* Frame 0 (0ms): Task_B, Task_E | Load: 1+4=5ms */
+    /* Frame 0 (0ms): B, A, D | Load: 1+1+2=4ms */
+    { .tasks = {job_B, job_A, job_D}, .names = {"Task_B", "Task_A", "Task_D"}, .num_tasks = 3 },
+    /* Frame 1 (5ms): B, F | Load: 1+2=3ms */
+    { .tasks = {job_B, job_F}, .names = {"Task_B", "Task_F"}, .num_tasks = 2 },
+    /* Frame 2 (10ms): B, A | Load: 1+1=2ms */
+    { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 },
+    /* Frame 3 (15ms): B, C | Load: 1+C (C is variable via GPIO) */
+    { .tasks = {job_B, job_C}, .names = {"Task_B", "Task_C"}, .num_tasks = 2 },
+    /* Frame 4 (20ms): B, A, F | Load: 1+1+2=4ms */
+    { .tasks = {job_B, job_A, job_F}, .names = {"Task_B", "Task_A", "Task_F"}, .num_tasks = 3 },
+    /* Frame 5 (25ms): B, C | Load: 1+C (C is variable via GPIO) */
+    { .tasks = {job_B, job_C}, .names = {"Task_B", "Task_C"}, .num_tasks = 2 },
+    /* Frame 6 (30ms): B, A | Load: 1+1=2ms */
+    { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 },
+    /* Frame 7 (35ms): B, E | Load: 1+4=5ms */
     { .tasks = {job_B, job_E}, .names = {"Task_B", "Task_E"}, .num_tasks = 2 },
-    /* Frame 1 (5ms): Task_B, Task_A | Load: 1+1=2ms */
-    { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 },
-    /* Frame 2 (10ms): Task_B, Task_D, Task_C | Load: 1+2+2=5ms */
-    { .tasks = {job_B, job_D, job_C}, .names = {"Task_B", "Task_D", "Task_C"}, .num_tasks = 3 },
-    /* Frame 3 (15ms): Task_B, Task_A | Load: 1+1=2ms */
-    { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 },
-    /* Frame 4 (20ms): Task_B, Task_F | Load: 1+2=3ms */
-    { .tasks = {job_B, job_F}, .names = {"Task_B", "Task_F"}, .num_tasks = 2 },
-    /* Frame 5 (25ms): Task_B, Task_A | Load: 1+1=2ms */
-    { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 },
-    /* Frame 6 (30ms): Task_B | Load: 1ms */
+    /* Frame 8 (40ms): B, A, F | Load: 1+1+2=4ms */
+    { .tasks = {job_B, job_A, job_F}, .names = {"Task_B", "Task_A", "Task_F"}, .num_tasks = 3 },
+    /* Frame 9 (45ms): B | Load: 1ms */
     { .tasks = {job_B}, .names = {"Task_B"}, .num_tasks = 1 },
-    /* Frame 7 (35ms): Task_B, Task_A, Task_C | Load: 1+1+2=4ms */
-    { .tasks = {job_B, job_A, job_C}, .names = {"Task_B", "Task_A", "Task_C"}, .num_tasks = 3 },
-    /* Frame 8 (40ms): Task_B, Task_F | Load: 1+2=3ms */
-    { .tasks = {job_B, job_F}, .names = {"Task_B", "Task_F"}, .num_tasks = 2 },
-    /* Frame 9 (45ms): Task_B, Task_A | Load: 1+1=2ms */
+    /* Frame 10 (50ms): B, A, D | Load: 1+1+2=4ms */
+    { .tasks = {job_B, job_A, job_D}, .names = {"Task_B", "Task_A", "Task_D"}, .num_tasks = 3 },
+    /* Frame 11 (55ms): B, C | Load: 1+C (C is variable via GPIO) */
+    { .tasks = {job_B, job_C}, .names = {"Task_B", "Task_C"}, .num_tasks = 2 },
+    /* Frame 12 (60ms): B, A, F | Load: 1+1+2=4ms */
+    { .tasks = {job_B, job_A, job_F}, .names = {"Task_B", "Task_A", "Task_F"}, .num_tasks = 3 },
+    /* Frame 13 (65ms): B, D | Load: 1+2=3ms */
+    { .tasks = {job_B, job_D}, .names = {"Task_B", "Task_D"}, .num_tasks = 2 },
+    /* Frame 14 (70ms): B, A | Load: 1+1=2ms */
     { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 },
-    /* Frame 10 (50ms): Task_B, Task_E | Load: 1+4=5ms */
+    /* Frame 15 (75ms): B, C | Load: 1+C (C is variable via GPIO) */
+    { .tasks = {job_B, job_C}, .names = {"Task_B", "Task_C"}, .num_tasks = 2 },
+    /* Frame 16 (80ms): B, A, F | Load: 1+1+2=4ms */
+    { .tasks = {job_B, job_A, job_F}, .names = {"Task_B", "Task_A", "Task_F"}, .num_tasks = 3 },
+    /* Frame 17 (85ms): B, E | Load: 1+4=5ms */
     { .tasks = {job_B, job_E}, .names = {"Task_B", "Task_E"}, .num_tasks = 2 },
-    /* Frame 11 (55ms): Task_B, Task_A | Load: 1+1=2ms */
+    /* Frame 18 (90ms): B, A | Load: 1+1=2ms */
     { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 },
-    /* Frame 12 (60ms): Task_B, Task_D, Task_C, Task_F | Load: 1+2+2+2=7ms - CAUTION: Overload by 2ms! */
-    { .tasks = {job_B, job_D, job_C, job_F}, .names = {"Task_B", "Task_D", "Task_C", "Task_F"}, .num_tasks = 4 },
-    /* Frame 13 (65ms): Task_B, Task_A | Load: 1+1=2ms */
-    { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 },
-    /* Frame 14 (70ms): Task_B | Load: 1ms */
-    { .tasks = {job_B}, .names = {"Task_B"}, .num_tasks = 1 },
-    /* Frame 15 (75ms): Task_B, Task_A | Load: 1+1=2ms */
-    { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 },
-    /* Frame 16 (80ms): Task_B, Task_F | Load: 1+2=3ms */
-    { .tasks = {job_B, job_F}, .names = {"Task_B", "Task_F"}, .num_tasks = 2 },
-    /* Frame 17 (85ms): Task_B, Task_A, Task_C | Load: 1+1+2=4ms */
-    { .tasks = {job_B, job_A, job_C}, .names = {"Task_B", "Task_A", "Task_C"}, .num_tasks = 3 },
-    /* Frame 18 (90ms): Task_B | Load: 1ms */
-    { .tasks = {job_B}, .names = {"Task_B"}, .num_tasks = 1 },
-    /* Frame 19 (95ms): Task_B, Task_A | Load: 1+1=2ms */
-    { .tasks = {job_B, job_A}, .names = {"Task_B", "Task_A"}, .num_tasks = 2 }
+    /* Frame 19 (95ms): B | Load: 1ms */
+    { .tasks = {job_B}, .names = {"Task_B"}, .num_tasks = 1 }
 };
 
 
@@ -99,21 +106,40 @@ static frame_schedule_t schedule[NUM_FRAMES] = {
  */
 void print_hyperperiod_report(void) {
     printf("\n========== Hyperperiod %u Report ==========\n", hyperperiod_count);
-    printf("Frame | Task   | Release    | Start      | Complete   | Exec Time\n");
-    printf("------+--------+------------+------------+------------+-----------\n");
+    printf("Frame | Task   | Release    | Start      | Complete   | Deadline   | Exec Time | Status\n");
+    printf("------+--------+------------+------------+------------+------------+-----------+---------\n");
 
     for (uint32_t i = 0; i < job_count; i++) {
-        printf(" %2u   | %-6s | %10llu | %10llu | %10llu | %6llu us\n",
+        const char* status;
+        if (job_log[i].exec_time == 0 && job_log[i].deadline_missed) {
+            status = " SKIPPED";
+        } else if (job_log[i].deadline_missed) {
+            status = "  MISS  ";
+        } else {
+            status = "   OK   ";
+        }
+
+        printf(" %2u   | %-6s | %10llu | %10llu | %10llu | %10llu | %6llu us | %s\n",
                job_log[i].frame,
                job_log[i].task_name,
                job_log[i].release_time,
                job_log[i].start_time,
                job_log[i].completion_time,
-               job_log[i].exec_time);
+               job_log[i].deadline,
+               job_log[i].exec_time,
+               status);
     }
 
-    printf("==============================================\n");
-    printf("Total jobs executed: %u\n\n", job_count);
+    printf("========================================================================================\n");
+    printf("Total jobs scheduled: %u\n", job_count);
+    printf("Deadline misses (this hyperperiod): %u\n", deadline_misses_current);
+    printf("Deadline misses (total): %u\n", deadline_misses_total);
+
+    if (deadline_misses_current > 0) {
+        printf("\n*** WARNING: Deadline misses detected! ***\n");
+        printf("Response Strategy: SKIP TASK_C IF INSUFFICIENT TIME BEFORE EXECUTION\n");
+    }
+    printf("\n");
 }
 
 /**
@@ -124,11 +150,68 @@ void print_hyperperiod_report(void) {
  */
 bool frame_callback(repeating_timer_t *tmr) {
     jobReturn_t result;
-    uint64_t frame_start = time_us_64();
+    uint64_t actual_time = time_us_64();
     uint32_t local_frame = current_frame % NUM_FRAMES;
+
+    /* Initialize scheduler start time on first callback */
+    if (current_frame == 0) {
+        scheduler_start_time = actual_time;
+    }
+
+    /* Calculate absolute deadline based on scheduler start time, not actual callback time */
+    uint64_t frame_start = scheduler_start_time + (current_frame * MINOR_FRAME_MS * 1000);
+    uint64_t frame_deadline = frame_start + (MINOR_FRAME_MS * 1000);  /* Deadline in microseconds */
 
     /* Execute all tasks scheduled for this frame (in order) */
     for (uint8_t i = 0; i < schedule[local_frame].num_tasks; i++) {
+        /* Special handling for Task_C: check if there's enough time before executing */
+        if (schedule[local_frame].tasks[i] == job_C) {
+            /* Read GPIO switches to get actual execution time for Task_C */
+            bool bit7 = BSP_GetInput(SW_10);
+            bool bit6 = BSP_GetInput(SW_11);
+            bool bit5 = BSP_GetInput(SW_12);
+            bool bit4 = BSP_GetInput(SW_13);
+            bool bit3 = BSP_GetInput(SW_14);
+            bool bit2 = BSP_GetInput(SW_15);
+            bool bit1 = BSP_GetInput(SW_16);
+            bool bit0 = BSP_GetInput(SW_17);
+
+            uint8_t switch_value = (bit7 << 7) | (bit6 << 6) | (bit5 << 5) | (bit4 << 4) |
+                                   (bit3 << 3) | (bit2 << 2) | (bit1 << 1) | bit0;
+
+            /* Calculate Task_C's actual execution time from GPIO */
+            uint32_t task_c_wcet_us = ((switch_value * 8000) / 256);  /* Note: actual execution is this - 10us, but we add margin */
+
+            /* Check if there's enough time to complete Task_C */
+            uint64_t current_time = time_us_64();
+            int64_t time_remaining = (int64_t)frame_deadline - (int64_t)current_time;
+
+            if (time_remaining < (int64_t)task_c_wcet_us) {
+                /* Not enough time - skip Task_C */
+                if (job_count < MAX_JOBS_PER_HYPERPERIOD) {
+                    job_log[job_count].frame = local_frame;
+                    job_log[job_count].task_name = schedule[local_frame].names[i];
+                    job_log[job_count].release_time = frame_start;
+                    job_log[job_count].start_time = 0;
+                    job_log[job_count].completion_time = 0;
+                    job_log[job_count].exec_time = 0;
+                    job_log[job_count].deadline = frame_deadline;
+                    job_log[job_count].deadline_missed = true;
+                    job_count++;
+                }
+
+                deadline_misses_current++;
+                deadline_misses_total++;
+
+                /* LED indication */
+                BSP_ToggleLED(LED_RED);
+
+                /* Note: Skip printf here to avoid blocking the scheduler */
+
+                continue;  /* Skip Task_C, move to next task */
+            }
+        }
+
         /* Execute the task */
         schedule[local_frame].tasks[i](&result);
 
@@ -140,16 +223,21 @@ bool frame_callback(repeating_timer_t *tmr) {
             job_log[job_count].start_time = result.start;
             job_log[job_count].completion_time = result.stop;
             job_log[job_count].exec_time = result.stop - result.start;
+            job_log[job_count].deadline = frame_deadline;
+            job_log[job_count].deadline_missed = (result.stop > frame_deadline);
             job_count++;
         }
-    }
 
-    uint64_t frame_end = time_us_64();
-    uint64_t frame_duration = frame_end - frame_start;
+        /* Check for deadline miss after execution */
+        if (result.stop > frame_deadline) {
+            deadline_misses_current++;
+            deadline_misses_total++;
 
-    /* Check for frame overrun */
-    if (frame_duration > (MINOR_FRAME_MS * 1000)) {
-        BSP_ToggleLED(LED_RED);
+            /* LED indication - Toggle red LED to signal error */
+            BSP_ToggleLED(LED_RED);
+
+            /* Note: Skip printf here to avoid blocking the scheduler */
+        }
     }
 
     /* Move to next frame */
@@ -164,6 +252,7 @@ bool frame_callback(repeating_timer_t *tmr) {
 
         /* Reset for next hyperperiod */
         job_count = 0;
+        deadline_misses_current = 0;
         hyperperiod_count++;
     }
 
@@ -197,6 +286,7 @@ int main()
     printf("Collecting data... Reports printed every %d ms\n\n", HYPERPERIOD_MS);
 
     /* Start the cyclic scheduler with 5ms frame timer */
+    /* Note: scheduler_start_time will be initialized on first callback */
     add_repeating_timer_ms(-MINOR_FRAME_MS, frame_callback, NULL, &frame_timer);
 
     /* Main loop - scheduler runs in timer callback */
